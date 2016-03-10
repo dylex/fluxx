@@ -67,7 +67,7 @@ runIn t f (RunM m) = RunM $ withExceptT (("In " ++ t ++ ' ' : f) ++) $ do
     liftIO . putStrLn =<< asks stateOutput
     m
   where
-  (n, e) = FP.splitExtension $ filter (not . (`elem` FP.pathSeparators)) f
+  (n, e) = FP.splitExtension $ filter (not . (`elem` ' ':FP.pathSeparators)) f
   f' = FP.makeValid $ FP.addExtension (take (255 - length e) n) e
 
 httpRequestJSON :: JS.FromJSON a => HC.Request -> RunM a
@@ -197,8 +197,8 @@ tagAttachments t =
   , url <- HC.parseUrl urls
   ]
 
-runGrantRequest :: String -> Model -> RunM ()
-runGrantRequest ncpf m = do
+runGrantRequest :: String -> String -> Model -> RunM ()
+runGrantRequest ncpf name m = do
   req <- asks stateRequest
   cache <- asks stateCache
   now <- asks stateTime
@@ -207,7 +207,7 @@ runGrantRequest ncpf m = do
         , HC.queryString = "?printable=1"
         }
       (cookie, _) = HC.computeCookieString preq (fold $ HC.cookieJar preq) now True
-  runIn "printable" (FP.addExtension ncpf ".pdf") $ do
+  runIn "printable" (FP.addExtension (ncpf ++ '_' : name) ".pdf") $ do
     out <- asks stateOutput
     liftIO $ callProcess "wkhtmltopdf" $
       [ "-q"
@@ -240,8 +240,8 @@ runModel m@Model{ modelClass = "GrantRequest" } = do
   (name, ncpf) <- case tagHText $ HTS.parseTree title of
     name : ncpf : _ -> return (name, takeWhile (\c -> isAlphaNum c || c == '-' || c == '_') ncpf)
     _ -> fail $ "Could not process title of model " ++ show (modelId m) ++ ": " ++ title
-  runIn "grant request" (ncpf ++ ' ' : name) $
-    runGrantRequest ncpf m
+  runIn "grant request" (ncpf ++ '_' : name) $
+    runGrantRequest ncpf name m
 runModel Model{ modelClass = c } = fail $ "unknown model class: " ++ T.unpack c
 
 runCard :: Card -> Int -> RunM ()
