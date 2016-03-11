@@ -1,6 +1,6 @@
 import Control.Arrow (Kleisli(..), (***))
 import Control.Exception (onException)
-import Control.Monad ((<=<), when, unless, forM_)
+import Control.Monad ((<=<), when, unless, forM_, foldM)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Except (MonadError, ExceptT, runExceptT, withExceptT, throwError)
 import Control.Monad.Reader (MonadReader, ReaderT, runReaderT, asks, local)
@@ -14,7 +14,7 @@ import Data.Char (isAlphaNum)
 import Data.Foldable (fold)
 import Data.Function (fix)
 import qualified Data.HashMap.Strict as HM
-import Data.List (foldl')
+import Data.List (foldl', elemIndices)
 import Data.Maybe (fromMaybe)
 import Data.Monoid ((<>))
 import qualified Data.Text as T
@@ -38,18 +38,25 @@ import System.IO (stderr, hPutStrLn, withFile, IOMode(WriteMode))
 import System.Process (callProcess)
 import qualified Text.HTML.TagSoup as HTS
 import qualified Text.HTML.TagSoup.Tree as HTS
+import Text.Read (readMaybe)
 
 titleUUID, attachmentUUID :: UUID.UUID
 titleUUID = read "cf887ff0-faab-467c-8786-a41e8ac4d9ea"
 attachmentUUID = read "d08507ce-1503-4bdc-d696-6c9728ec747c"
 
 data State = State
-  { stateTime :: UTCTime
-  , stateCache :: FilePath
-  , stateHTTP :: HC.Manager
-  , stateRequest :: HC.Request
+  { stateTime :: !UTCTime
+  , stateCache :: !FilePath
+  , stateHTTP :: !HC.Manager
+  , stateRequest :: !HC.Request
   , stateOutput :: FilePath
   }
+
+isAlphaNumIsh :: Char -> Bool
+isAlphaNumIsh '-' = True
+isAlphaNumIsh '.' = True
+isAlphaNumIsh '_' = True
+isAlphaNumIsh c = isAlphaNum c
 
 newtype RunM a = RunM { runM :: ExceptT String (ReaderT State IO) a }
   deriving (Functor, Applicative, MonadReader State, MonadError String, MonadIO)
@@ -67,7 +74,7 @@ runIn t f (RunM m) = RunM $ withExceptT (("In " ++ t ++ ' ' : f) ++) $ do
     liftIO . putStrLn =<< asks stateOutput
     m
   where
-  (n, e) = FP.splitExtension $ filter (not . (`elem` ' ':FP.pathSeparators)) f
+  (n, e) = FP.splitExtension $ filter isAlphaNumIsh f
   f' = FP.makeValid $ FP.addExtension (take (255 - length e) n) e
 
 httpRequestJSON :: JS.FromJSON a => HC.Request -> RunM a
@@ -191,11 +198,7 @@ tagHText :: [HTS.TagTree String] -> [String]
 tagHText t = [ tagText tt | HTS.TagBranch ['h',d] _ tt <- t, d >= '1' && d <= '4' ]
 
 tagAttachments :: [HTS.TagTree String] -> [(HC.Request, String)]
-tagAttachments t =
-  [ (url, name)
-  | HTS.TagBranch "a" (("href", urls) : _) [HTS.TagLeaf (HTS.TagText name)] <- t
-  , url <- HC.parseUrl urls
-  ]
+tagAttachments t = [ (url, name) | HTS.TagBranch "a" (("href", HC.parseUrl -> Just url) : _) [HTS.TagLeaf (HTS.TagText name)] <- t ]
 
 runGrantRequest :: String -> String -> Model -> RunM ()
 runGrantRequest ncpf name m = do
@@ -238,7 +241,7 @@ runModel :: Model -> RunM ()
 runModel m@Model{ modelClass = "GrantRequest" } = do
   title <- getModelOption titleUUID m
   (name, ncpf) <- case tagHText $ HTS.parseTree title of
-    name : ncpf : _ -> return (name, takeWhile (\c -> isAlphaNum c || c == '-' || c == '_') ncpf)
+    name@(_:_) : (takeWhile isAlphaNumIsh -> ncpf@(_:_)) : _ -> return (name, ncpf)
     _ -> fail $ "Could not process title of model " ++ show (modelId m) ++ ": " ++ title
   runIn "grant request" (ncpf ++ '_' : name) $
     runGrantRequest ncpf name m
@@ -246,7 +249,7 @@ runModel Model{ modelClass = c } = fail $ "unknown model class: " ++ T.unpack c
 
 runCard :: Card -> Int -> RunM ()
 runCard card@Card{ cardUrl = Just url@"/grant_requests" } page = do
-  liftIO $ putStrLn $ "\tpage " ++ show page
+  liftIO $ hPutStrLn stderr $ "\tpage " ++ show page
   req <- asks stateRequest
   l <- httpRequestJSON req
     { HC.path = url <> ".json"
@@ -256,8 +259,8 @@ runCard card@Card{ cardUrl = Just url@"/grant_requests" } page = do
   when (listPageNext l) $ runCard card (succ page)
 runCard _ _ = return ()
 
-runDashboard :: String -> RunM ()
-runDashboard name = do
+runDashboard :: String -> Maybe (String, Int) -> RunM ()
+runDashboard name rest = do
   req <- asks stateRequest
 
   ClientStore cs <- httpRequestJSON req
@@ -268,15 +271,23 @@ runDashboard name = do
     lookup name cs
   
   liftIO $ hPutStrLn stderr "Processing cards..."
-  forM_ cards $ \card -> do
-    let title = T.unpack $ tagText $ HTS.parseTree $ cardTitle card
-    runIn "card" title $ runCard card 1
+  r <- foldM (\r c -> do
+    let t = T.unpack $ tagText $ HTS.parseTree $ cardTitle c
+    liftIO $ hPutStrLn stderr t
+    runIn "card" t $ case r of
+      Nothing -> r <$ runCard c 1
+      Just (rt, rp) | rt == t ->
+        Nothing <$ runCard c rp
+      _ -> return r)
+    rest cards
+  forM_ r $ \(c, _) -> fail $ "Card " ++ c ++ " not found"
 
 data Opts = Opts
-  { optDomain :: String
-  , optUser :: Maybe String
-  , optPass :: Maybe String
-  , optOutput :: FilePath
+  { optDomain :: !String
+  , optUser :: !(Maybe String)
+  , optPass :: !(Maybe String)
+  , optOutput :: !FilePath
+  , optRestart :: !(Maybe (String, Int))
   }
 
 defOpts :: Opts
@@ -285,6 +296,7 @@ defOpts = Opts
   , optUser = Nothing
   , optPass = Nothing
   , optOutput = ""
+  , optRestart = Nothing
   }
 
 options :: [Opt.OptDescr (Opts -> Opts)]
@@ -301,6 +313,17 @@ options =
   , Opt.Option "o" ["output"]
       (Opt.ReqArg (\i o -> o{ optOutput = i }) "DIRECTORY")
       "output to directory (must exist) [current]"
+  , Opt.Option "r" ["restart"]
+      (Opt.ReqArg (\i o -> o{ optRestart =
+        case reverse $ elemIndices '@' i of
+          (n:_)
+            | n > 0
+            , (c,'@':s) <- splitAt n i
+            , Just p <- readMaybe s
+            , p > 0 -> Just (c, p)
+          _ -> Just (i, 1)
+      }) "CARD[@PAGE]")
+      "restart at card and page"
   ]
 
 main :: IO ()
@@ -343,7 +366,7 @@ main = do
   unless (any ((==) "user_credentials" . HC.cookie_name) $ HC.destroyCookieJar cj) $ fail "Login failed"
   writeFile cjf $ show cj
 
-  r <- runReaderT (runExceptT $ runM $ runDashboard dashname) State
+  r <- runReaderT (runExceptT $ runM $ runDashboard dashname $ optRestart opts) State
     { stateTime = now
     , stateCache = cache
     , stateHTTP = hc
