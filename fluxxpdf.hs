@@ -45,7 +45,8 @@ titleUUID = read "cf887ff0-faab-467c-8786-a41e8ac4d9ea"
 attachmentUUID = read "d08507ce-1503-4bdc-d696-6c9728ec747c"
 
 data State = State
-  { stateTime :: !UTCTime
+  { stateOpts :: !Opts
+  , stateTime :: !UTCTime
   , stateCache :: !FilePath
   , stateHTTP :: !HC.Manager
   , stateRequest :: !HC.Request
@@ -70,12 +71,13 @@ instance Monad RunM where
 runIn :: String -> FilePath -> RunM a -> RunM a
 runIn t f (RunM m) = RunM $ withExceptT (("In " ++ t ++ ' ' : f) ++) $ do
   liftIO . createDirectoryIfMissing False =<< asks stateOutput
+  ml <- asks (optMaxlen . stateOpts)
+  let f' = FP.makeValid $ FP.addExtension (take (ml - length e) n) e
   local (\s -> s{ stateOutput = stateOutput s FP.</> f' }) $ do
     liftIO . putStrLn =<< asks stateOutput
     m
   where
   (n, e) = FP.splitExtension $ filter isAlphaNumIsh f
-  f' = FP.makeValid $ FP.addExtension (take (255 - length e) n) e
 
 httpRequestJSON :: JS.FromJSON a => HC.Request -> RunM a
 httpRequestJSON q = do
@@ -235,7 +237,7 @@ runGrantRequest ncpf name m = do
         ] of
       [a] -> return a
       _ -> fail $ "Could not process attachment of model " ++ show (modelId m) ++ ": " ++ link
-    runIn "attachment" (ncpf ++ '_' : aname) $ httpRequestDownload areq
+    runIn "attachment" (ncpf ++ '_' : if aname == name then "map_" ++ aname else aname) $ httpRequestDownload areq
 
 runModel :: Model -> RunM ()
 runModel m@Model{ modelClass = "GrantRequest" } = do
@@ -259,8 +261,8 @@ runCard card@Card{ cardUrl = Just url@"/grant_requests" } page = do
   when (listPageNext l) $ runCard card (succ page)
 runCard _ _ = return ()
 
-runDashboard :: String -> Maybe (String, Int) -> RunM ()
-runDashboard name rest = do
+runDashboard :: String -> RunM ()
+runDashboard name = do
   req <- asks stateRequest
 
   ClientStore cs <- httpRequestJSON req
@@ -271,6 +273,7 @@ runDashboard name rest = do
     lookup name cs
   
   liftIO $ hPutStrLn stderr "Processing cards..."
+  rest <- asks (optRestart . stateOpts)
   r <- foldM (\r c -> do
     let t = T.unpack $ tagText $ HTS.parseTree $ cardTitle c
     liftIO $ hPutStrLn stderr t
@@ -287,6 +290,7 @@ data Opts = Opts
   , optUser :: !(Maybe String)
   , optPass :: !(Maybe String)
   , optOutput :: !FilePath
+  , optMaxlen :: !Int
   , optRestart :: !(Maybe (String, Int))
   }
 
@@ -296,6 +300,7 @@ defOpts = Opts
   , optUser = Nothing
   , optPass = Nothing
   , optOutput = ""
+  , optMaxlen = 46
   , optRestart = Nothing
   }
 
@@ -313,6 +318,9 @@ options =
   , Opt.Option "o" ["output"]
       (Opt.ReqArg (\i o -> o{ optOutput = i }) "DIRECTORY")
       "output to directory (must exist) [current]"
+  , Opt.Option "m" ["maxfile"]
+      (Opt.ReqArg (\i o -> o{ optOutput = i }) "LENGTH")
+      ("maximum length of path component [" ++ show (optMaxlen defOpts) ++ "]")
   , Opt.Option "r" ["restart"]
       (Opt.ReqArg (\i o -> o{ optRestart =
         case reverse $ elemIndices '@' i of
@@ -366,8 +374,9 @@ main = do
   unless (any ((==) "user_credentials" . HC.cookie_name) $ HC.destroyCookieJar cj) $ fail "Login failed"
   writeFile cjf $ show cj
 
-  r <- runReaderT (runExceptT $ runM $ runDashboard dashname $ optRestart opts) State
-    { stateTime = now
+  r <- runReaderT (runExceptT $ runM $ runDashboard dashname) State
+    { stateOpts = opts
+    , stateTime = now
     , stateCache = cache
     , stateHTTP = hc
     , stateRequest = baseReq{ HC.cookieJar = Just cj }
