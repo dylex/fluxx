@@ -216,7 +216,7 @@ runGrantRequest ncpf name m = do
     out <- asks stateOutput
     liftIO $ callProcess "wkhtmltopdf" $
       [ "-q"
-      , "-s", "Letter", "-B", "10cm", "-T", "10cm"
+      , "-s", "Letter", "-B", "10mm", "-T", "10mm"
       , "--cache-dir", cache
       , "--custom-header", "Cookie", BSC.unpack cookie, "--no-custom-header-propagation"
       , URI.uriToString id (HC.getUri preq) ""
@@ -245,7 +245,7 @@ runModel m@Model{ modelClass = "GrantRequest" } = do
   (name, ncpf) <- case tagHText $ HTS.parseTree title of
     name@(_:_) : (takeWhile isAlphaNumIsh -> ncpf@(_:_)) : _ -> return (name, ncpf)
     _ -> fail $ "Could not process title of model " ++ show (modelId m) ++ ": " ++ title
-  runIn "grant request" (ncpf ++ '_' : name) $
+  runIn "grant request" (ncpf ++ '_' : (filter ('.' /=) name)) $
     runGrantRequest ncpf name m
 runModel Model{ modelClass = c } = fail $ "unknown model class: " ++ T.unpack c
 
@@ -277,7 +277,7 @@ runDashboard name = do
   r <- foldM (\r c -> do
     let t = T.unpack $ tagText $ HTS.parseTree $ cardTitle c
     liftIO $ hPutStrLn stderr t
-    runIn "card" t $ case r of
+    runIn "card" (filter ('.' /=) t) $ case r of
       Nothing -> r <$ runCard c 1
       Just (rt, rp) | rt == t ->
         Nothing <$ runCard c rp
